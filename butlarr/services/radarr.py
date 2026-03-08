@@ -4,7 +4,7 @@ from typing import Optional, List, Any, Literal
 from dataclasses import dataclass, replace, field
 
 from . import ArrService, ArrVariant, Action, ServiceContent, find_first, format_size
-from .ext import ExtArrService
+from .ext import ExtArrService, QueueState
 from ..tg_handler import command, callback, handler
 from ..tg_handler.message import Response, repaint, clear
 from ..tg_handler.auth import authorized
@@ -30,60 +30,41 @@ def _release_button_label(r: dict) -> str:
 
 
 @dataclass(frozen=True)
-class SeasonState:
-    available: List[int]
-    selected: List[int]
-
-
-@dataclass(frozen=True)
 class State:
     items: List[Any]
     index: int
     quality_profile: Any
-    language_profile: Any
     tags: List[str]
     root_folder: Any
-    seasons: SeasonState
     menu: Optional[
-        Literal["path"] | Literal["tags"] | Literal["quality"]
-        | Literal["language"] | Literal["add"] | Literal["releases"]
+        Literal["path"] | Literal["tags"] | Literal["quality"] | Literal["add"] | Literal["releases"]
     ]
     releases: Optional[List[Any]] = field(default=None)
     release_page: int = 0
 
 
 @handler
-class Sonarr(ExtArrService, ArrService):
+class Radarr(ExtArrService, ArrService):
     def __init__(self, commands: List[str], api_host: str, api_key: str):
         self.commands = commands
         self.api_key = api_key
 
         self.api_version = self.detect_api(api_host)
-        self.service_content = ServiceContent.SERIES
-        self.arr_variant = ArrVariant.SONARR
+        self.service_content = ServiceContent.MOVIE
+        self.arr_variant = ArrVariant.RADARR
         self.root_folders = self.get_root_folders()
         self.quality_profiles = self.get_quality_profiles()
-        self.language_profiles = self.get_language_profiles()
 
         if not self.root_folders:
             logger.warning(
                 "No root folders configured! Please configure root folders inside the "
-                "Sonarr interface. Otherwise Butlarr might not behave as expected."
+                "Radarr interface. Otherwise Butlarr might not behave as expected."
             )
         if not self.quality_profiles:
             logger.warning(
                 "No quality profiles configured! Please configure quality profiles inside "
-                "the Sonarr interface. Otherwise Butlarr might not behave as expected."
+                "the Radarr interface. Otherwise Butlarr might not behave as expected."
             )
-        if not self.language_profiles:
-            logger.warning(
-                "No language profiles configured! Please configure language profiles inside "
-                "the Sonarr interface. Otherwise Butlarr might not behave as expected."
-            )
-
-    def _get_season_state(self, item):
-        available_seasons = [e.get("seasonNumber") for e in item.get("seasons", [])]
-        return SeasonState(available=available_seasons, selected=[])
 
     @keyboard
     def keyboard(self, state: State):
@@ -92,7 +73,7 @@ class Sonarr(ExtArrService, ArrService):
 
         rows_menu = []
 
-        # ── Releases picker ───────────────────────────────────────────────────
+        # ── Releases picker ──────────────────────────────────────────────────
         if state.menu == "releases":
             row_navigation = [Button("=== Available Releases ===", "noop")]
             releases = state.releases or []
@@ -123,7 +104,7 @@ class Sonarr(ExtArrService, ArrService):
         # ── Add / edit menu ───────────────────────────────────────────────────
         elif state.menu == "add":
             row_navigation = [
-                Button("=== Editing Series ===" if in_library else "=== Adding Series ===", "noop")
+                Button("=== Editing Movie ===" if in_library else "=== Adding Movie ===", "noop")
             ]
             rows_menu = [
                 [Button(
@@ -134,21 +115,6 @@ class Sonarr(ExtArrService, ArrService):
                     f"Change Path   ({state.root_folder.get('path', '-')})",
                     self.get_clbk("path", state.index),
                 )],
-                [Button(
-                    f"Change Language   ({state.language_profile.get('name', '-')})",
-                    self.get_clbk("language", state.index),
-                )],
-            ]
-
-        # ── Season search ─────────────────────────────────────────────────────
-        elif state.menu == "seasons":
-            row_navigation = [Button("=== Search for Seasons ===")]
-            rows_menu = [
-                [Button(
-                    f"{'✔' if sid in state.seasons.selected else '🔍'} Season {sid}",
-                    self.get_clbk("noop" if sid in state.seasons.selected else "searchseason", sid),
-                )]
-                for sid in state.seasons.available
             ]
 
         # ── Path selector ─────────────────────────────────────────────────────
@@ -167,34 +133,23 @@ class Sonarr(ExtArrService, ArrService):
                 for p in self.quality_profiles
             ]
 
-        # ── Language selector ─────────────────────────────────────────────────
-        elif state.menu == "language":
-            row_navigation = [Button("=== Selecting Language Profile ===")]
-            rows_menu = [
-                [Button(p.get("name", "-"), self.get_clbk("selectlanguage", p.get("id")))]
-                for p in self.language_profiles
-            ]
-
         # ── Default view ──────────────────────────────────────────────────────
         else:
             if in_library:
                 monitored = item.get("monitored", True)
                 missing = not item.get("hasFile", False)
-                rows_menu = [
-                    [Button("🔍 Search for Seasons", self.get_clbk("seasons", state.index))],
-                    [
-                        Button("📺 Monitored" if monitored else "Unmonitored"),
-                        Button("💾 Missing" if missing else "Downloaded"),
-                    ],
-                ]
+                rows_menu = [[
+                    Button("📺 Monitored" if monitored else "Unmonitored"),
+                    Button("💾 Missing" if missing else "Downloaded"),
+                ]]
             row_navigation = [
                 (
                     Button("⬅ Prev", self.get_clbk("goto", state.index - 1))
                     if state.index > 0 else Button()
                 ),
                 (
-                    Button("TVDB", url=f"https://www.thetvdb.com/?id={item['tvdbId']}&tab=series")
-                    if item.get("tvdbId") else None
+                    Button("TMDB", url=f"https://www.themoviedb.org/movie/{item['tmdbId']}")
+                    if item.get("tmdbId") else None
                 ),
                 (
                     Button("IMDB", url=f"https://imdb.com/title/{item['imdbId']}")
@@ -232,19 +187,12 @@ class Sonarr(ExtArrService, ArrService):
                 rows_action.append([Button("➕ Add", self.get_clbk("addmenu"))])
             elif state.menu == "add":
                 rows_action.append([
-                    Button("📚 Add (No Monitor)", self.get_clbk("add", "no-monitor")),
-                ])
-                rows_action.append([
-                    Button("📺 Monitor All", self.get_clbk("add", "no-search")),
+                    Button("📺 Monitor", self.get_clbk("add", "no-search")),
                     Button("🔍 Monitor & Search", self.get_clbk("add", "search")),
                 ])
 
-        back_target = (
-            "goto" if state.menu in ("seasons", "add", "releases")
-            else "addmenu" if state.menu else "goto"
-        )
         if state.menu:
-            rows_action.append([Button("🔙 Back", self.get_clbk(back_target))])
+            rows_action.append([Button("🔙 Back", self.get_clbk("goto"))])
         else:
             rows_action.append([Button("❌ Cancel", self.get_clbk("cancel"))])
 
@@ -252,7 +200,7 @@ class Sonarr(ExtArrService, ArrService):
 
     def create_message(self, state: State, full_redraw=False):
         if not state.items:
-            return Response(caption="No series found", state=state)
+            return Response(caption="No movies found", state=state)
 
         item = state.items[state.index]
         keyboard_markup = self.keyboard(state)
@@ -292,15 +240,8 @@ class Sonarr(ExtArrService, ArrService):
                     lambda x: items[0].get("qualityProfileId") == x.get("id"),
                 ) if items else None
             ),
-            language_profile=(
-                find_first(
-                    self.language_profiles,
-                    lambda x: items[0].get("languageProfileId") == x.get("id"),
-                ) if items else None
-            ),
             tags=items[0].get("tags", []) if items else [],
             menu=None,
-            seasons=self._get_season_state(items[0]) if items else SeasonState([], []),
         )
 
     # ── Commands ──────────────────────────────────────────────────────────────
@@ -309,8 +250,8 @@ class Sonarr(ExtArrService, ArrService):
     @command(
         default=True,
         default_pattern="<title>",
-        default_description="Search for a series",
-        cmds=[("search", "<title>", "Search for a series")],
+        default_description="Search for a movie",
+        cmds=[("search", "<title>", "Search for a movie")],
     )
     @sessionState(init=True)
     @authorized
@@ -323,24 +264,18 @@ class Sonarr(ExtArrService, ArrService):
         self.session_db.add_session_entry(default_session_state_key_fn(self, update), state)
         return self.create_message(state, full_redraw=True)
 
-    @command(cmds=[("help", "", "Shows only the sonarr help page")])
+    @command(cmds=[("help", "", "Shows only the radarr help page")])
     async def cmd_help(self, update, context, args):
         return await ExtArrService.cmd_help(self, update, context, args)
 
     @repaint
-    @command(cmds=[("queue", "", "Shows the sonarr download queue")])
+    @command(cmds=[("queue", "", "Shows the radarr download queue")])
     @authorized
     async def cmd_queue(self, update, context, args):
         return await ExtArrService.cmd_queue(self, update, context, args)
 
     @repaint
-    @callback(cmds=["queue"])
-    @authorized
-    async def clbk_queue(self, update, context, args):
-        return await ExtArrService.clbk_queue(self, update, context, args)
-
-    @repaint
-    @command(cmds=[("list", "", "List all series in the library")])
+    @command(cmds=[("list", "", "List all movies in the library")])
     @authorized
     async def cmd_list(self, update, context, args):
         items = self.list_()
@@ -351,10 +286,15 @@ class Sonarr(ExtArrService, ArrService):
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
     @repaint
+    @callback(cmds=["queue"])
+    @authorized
+    async def clbk_queue(self, update, context, args):
+        return await ExtArrService.clbk_queue(self, update, context, args)
+
+    @repaint
     @callback(cmds=[
-        "goto", "tags", "addtag", "remtag", "seasons", "searchseason",
-        "path", "selectpath", "quality", "selectquality",
-        "language", "selectlanguage", "addmenu",
+        "goto", "tags", "addtag", "remtag", "path",
+        "selectpath", "quality", "selectquality", "addmenu",
     ])
     @sessionState()
     @authorized
@@ -377,28 +317,12 @@ class Sonarr(ExtArrService, ArrService):
                     ),
                     tags=item.get("tags", []),
                     menu=None,
-                    seasons=self._get_season_state(item),
                     releases=None,
                     release_page=0,
                 )
                 full_redraw = True
             else:
                 state = replace(state, menu=None, releases=None, release_page=0)
-        elif args[0] == "seasons":
-            state = replace(state, menu="seasons")
-        elif args[0] == "searchseason":
-            item = state.items[state.index]
-            self.request(
-                "command",
-                action=Action.POST,
-                params={
-                    "name": "SeasonSearch",
-                    "seriesId": item.get("id"),
-                    "seasonNumber": int(args[1]),
-                },
-            )
-            season_state = replace(state.seasons, selected=[*state.seasons.selected, int(args[1])])
-            state = replace(state, seasons=season_state)
         elif args[0] == "tags":
             state = replace(state, tags=[], menu="tags")
         elif args[0] == "addtag":
@@ -415,11 +339,6 @@ class Sonarr(ExtArrService, ArrService):
         elif args[0] == "selectquality":
             quality_profile = self.get_quality_profile(args[1])
             state = replace(state, quality_profile=quality_profile, menu="add")
-        elif args[0] == "language":
-            state = replace(state, menu="language")
-        elif args[0] == "selectlanguage":
-            language_profile = self.get_language_profile(args[1])
-            state = replace(state, language_profile=language_profile, menu="add")
         elif args[0] == "addmenu":
             state = replace(state, menu="add")
 
@@ -431,8 +350,9 @@ class Sonarr(ExtArrService, ArrService):
     @authorized
     async def clbk_releases(self, update, context, args, state):
         if args[0] == "releases":
+            # Fetch releases from Radarr — may take a second
             item = state.items[state.index]
-            releases = self.get_releases(seriesId=item["id"])
+            releases = self.get_releases(movieId=item["id"])
             state = replace(state, menu="releases", releases=releases, release_page=0)
         elif args[0] == "relpage":
             state = replace(state, release_page=int(args[1]))
@@ -466,21 +386,15 @@ class Sonarr(ExtArrService, ArrService):
     async def clbk_add(self, update, context, args, state):
         result = self.add(
             item=state.items[state.index],
-            quality_profile_id=state.quality_profile.get("id", 0),
-            language_profile_id=state.language_profile.get("id", 0),
-            root_folder_path=state.root_folder.get("path", ""),
+            quality_profile_id=state.quality_profile.get("id"),
+            root_folder_path=state.root_folder.get("path"),
             tags=state.tags,
-            options={
-                "addOptions": {
-                    "searchForMissingEpisodes": args[1] == "search",
-                    "monitor": "none" if args[1] == "no-monitor" else "all",
-                },
-            },
+            options={"addOptions": {"searchForMovie": args[1] == "search"}},
         )
         if not result:
             return Response(caption="Seems like something went wrong...")
         return Response(
-            caption="Series updated!" if state.items[state.index].get("id") else "Series added!"
+            caption="Movie updated!" if state.items[state.index].get("id") else "Movie added!"
         )
 
     @clear
@@ -496,4 +410,4 @@ class Sonarr(ExtArrService, ArrService):
     @authorized
     async def clbk_remove(self, update, context, args, state):
         self.remove(id=state.items[state.index].get("id"))
-        return Response(caption="Series removed!")
+        return Response(caption="Movie removed!")

@@ -216,7 +216,7 @@ class Sonarr(ExtArrService, ArrService):
         rows_action = []
         if in_library:
             if state.menu == "releases":
-                rows_action.append([Button("✅ Done", self.get_clbk("cancel"))])
+                rows_action.append([Button("✅ Done", self.get_clbk("done"))])
             elif state.menu == "add":
                 rows_action.append([
                     Button("🗑 Remove", self.get_clbk("remove")),
@@ -248,7 +248,7 @@ class Sonarr(ExtArrService, ArrService):
                     Button("🎯 Monitor & Pick", self.get_clbk("monitorpick")),
                 ])
             elif state.menu == "releases":
-                rows_action.append([Button("✅ Done", self.get_clbk("cancel"))])
+                rows_action.append([Button("✅ Done", self.get_clbk("done"))])
 
         back_target = (
             "goto" if state.menu in ("seasons", "add", "releases")
@@ -544,6 +544,25 @@ class Sonarr(ExtArrService, ArrService):
         )
         self.session_db.add_session_entry(default_session_state_key_fn(self, update), state)
         return self.create_message(state, full_redraw=True)
+
+    @clear
+    @callback(cmds=["done"])
+    @sessionState(clear=True)
+    @authorized
+    async def clbk_done(self, update, context, args, state):
+        downloaded = state.downloaded or []
+        releases = state.releases or []
+        if not downloaded:
+            return Response(caption="No releases were downloaded.")
+        lines = [f"⬇️ Download started for {len(downloaded)} release(s):\n"]
+        for idx in downloaded:
+            if idx < len(releases):
+                r = releases[idx]
+                quality = r.get("quality", {}).get("quality", {}).get("name", "?")
+                size = format_size(r.get("size", 0))
+                title = r.get("title", "Unknown")[:50]
+                lines.append(f"• {quality}  {size}\n  {title}")
+        return Response(caption="\n".join(lines))
 
     @clear
     @callback(cmds=["cancel"])

@@ -14,19 +14,22 @@ from ..tg_handler.keyboard import Button, keyboard
 RELEASES_PER_PAGE = 5
 
 
-def _release_button_label(r: dict) -> str:
-    """Single-line label for a release Telegram button."""
+def _release_row1(r: dict) -> str:
+    """First row: approval + quality + size (non-clickable header)."""
     approved = "✅" if r.get("approved") else "⚠️"
     quality = r.get("quality", {}).get("quality", {}).get("name", "?")
     size = format_size(r.get("size", 0))
+    return f"{approved} {quality}  {size}"
+
+def _release_row2_sp(r: dict) -> str:
+    """Second row: seeders/peers label."""
     seeders = r.get("seeders")
     peers = r.get("leechers")
-    sp = ""
     if seeders is not None and peers is not None:
-        sp = f"  S:{seeders} P:{peers}"
+        return f"S:{seeders} P:{peers}"
     elif seeders is not None:
-        sp = f"  S:{seeders}"
-    return f"{approved} {quality}  {size}{sp}"
+        return f"S:{seeders}"
+    return "S:?"
 
 
 @dataclass(frozen=True)
@@ -91,14 +94,20 @@ class Radarr(ExtArrService, ArrService):
                 for i, r in enumerate(page_releases):
                     abs_idx = start + i
                     if abs_idx in state.downloaded:
-                        label = f"⬇️ {_release_button_label(r)}"
+                        # Row 1: quality + size, marked as downloading
+                        rows_menu.append([Button(f"⬇️ {_release_row1(r)}", "noop")])
+                        # Row 2: seeders (greyed out) + info
                         rows_menu.append([
-                            Button(label, "noop"),
+                            Button(_release_row2_sp(r), "noop"),
                             Button("ℹ️", self.get_clbk("relinfo", abs_idx)),
                         ])
                     else:
+                        # Row 1: quality + size (non-clickable)
+                        rows_menu.append([Button(_release_row1(r), "noop")])
+                        # Row 2: seeders/peers + download + info
                         rows_menu.append([
-                            Button(_release_button_label(r), self.get_clbk("dlrelease", abs_idx)),
+                            Button(_release_row2_sp(r), "noop"),
+                            Button("⬇️ Download", self.get_clbk("dlrelease", abs_idx)),
                             Button("ℹ️", self.get_clbk("relinfo", abs_idx)),
                         ])
 

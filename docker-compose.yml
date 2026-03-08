@@ -1,12 +1,21 @@
 services:
   butlarr:
     container_name: butlarr
-    image: trimforce/butlarr:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: butlarr:latest
     volumes:
+      # Persistent session storage
       - ./data:/app/data
-      - ./config.yaml:/app/config.yaml
+      # Config file (see templates/config.yaml for reference)
+      - ./config.yaml:/app/config.yaml:ro
     environment:
-      - BUTLARR_CONFIG_FILE=./config.yaml
-      - BUTLARR_INTERACTIVE_SETUP=false
+      - BUTLARR_CONFIG_FILE=/app/config.yaml
     restart: unless-stopped
-
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import butlarr"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

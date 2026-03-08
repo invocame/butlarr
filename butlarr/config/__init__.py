@@ -1,14 +1,13 @@
 import yaml
 import os
-from collections import defaultdict
 from loguru import logger
 
 
 def load_config_from_file():
     config_file = os.getenv("BUTLARR_CONFIG_FILE") or "config.yaml"
     logger.info(f'Loading config from file "{config_file}"')
-    with open(config_file, "r") as config_file:
-        return yaml.safe_load(config_file)
+    with open(config_file, "r") as f:
+        return yaml.safe_load(f)
 
 
 def _get_env_vars_with_prefix(prefix):
@@ -40,10 +39,9 @@ def _inject_service_conf(config):
             indexes[name] = index_carry
             index_carry += 1
 
-    def update_config(key, value, field, prefix, suffix):
+    def update_config_simple(key, value, field, prefix, suffix):
         name = key.removeprefix(prefix).removesuffix(suffix).lower()
         check_indexes(name)
-
         while indexes[name] >= len(config["services"]):
             config["services"].append({})
         config["services"][indexes[name]][field] = value
@@ -52,17 +50,14 @@ def _inject_service_conf(config):
     for key, val in service_envs:
         for field, suffix in options:
             if key.endswith(suffix):
-                v = val
-                if suffix == "api":
-                    v = v.lower()
-                update_config(key, v, field, "BUTLARR_SERVICES_", suffix)
+                v = val.lower() if suffix == "_API" else val
+                update_config_simple(key, v, field, "BUTLARR_SERVICES_", suffix)
 
-    def update_config(key, value, field, prefix, suffix):
+    def update_config_list(key, value, field, prefix, suffix):
         (name, idx) = key.removeprefix(prefix).replace(suffix, "_").rsplit("_", 1)
         idx = int(idx)
         name = name.lower()
         check_indexes(name)
-
         if indexes[name] >= len(config["services"]):
             config["services"].append({})
         if field not in config["services"][indexes[name]]:
@@ -76,7 +71,20 @@ def _inject_service_conf(config):
     for key, value in service_envs:
         for field, suffix in list_options:
             if suffix in key:
-                update_config(key, value, field, "BUTLARR_SERVICES_", suffix)
+                update_config_list(key, value, field, "BUTLARR_SERVICES_", suffix)
+
+
+def _inject_whitelist(config):
+    """
+    Read BUTLARR_WHITELIST_0, BUTLARR_WHITELIST_1, … and add them to the
+    whitelist list as integers.
+    """
+    entries = _get_env_vars_with_prefix("BUTLARR_WHITELIST_")
+    for val in entries.values():
+        try:
+            config["whitelist"].append(int(val))
+        except ValueError:
+            logger.warning(f"Whitelist entry '{val}' is not a valid integer ID — skipped.")
 
 
 def load_config_from_env():
@@ -85,30 +93,25 @@ def load_config_from_env():
         "telegram": {
             "token": os.getenv("TELEGRAM_BOT_TOKEN"),
         },
-        "auth_passwords": {
-            "admin": os.getenv("BUTLARR_ADMIN_PASSWORD"),
-            "mod": os.getenv("BUTLARR_MOD_PASSWORD"),
-            "user": os.getenv("BUTLARR_USER_PASSWORD"),
-        },
+        "whitelist": [],
         "apis": {},
         "services": [],
     }
 
     _inject_api_conf(config)
     _inject_service_conf(config)
+    _inject_whitelist(config)
 
-    # Clean up commands, to not include empty elements
+    # Clean up commands — remove empty elements
     for s in config["services"]:
-        s["commands"] = list(filter(bool, s["commands"]))
+        s["commands"] = list(filter(bool, s.get("commands", [])))
 
     return config
 
 
 def load_config():
     use_env_config = os.getenv("BUTLARR_USE_ENV_CONFIG", "False").lower() in (
-        "true",
-        "1",
-        "t",
+        "true", "1", "t",
     )
     if use_env_config:
         if config := load_config_from_env():

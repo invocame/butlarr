@@ -10,7 +10,7 @@ from ..session_database import SessionDatabase
 def find_first(elems, check, fallback=0):
     try:
         result = next(e for e in elems if check(e))
-    except:
+    except Exception:
         result = None
     finally:
         if not result and elems:
@@ -87,7 +87,6 @@ class ArrService(TelegramHandler):
 
     def detect_api(self, api_host):
         status = None
-        # Detect version and api_url
         try:
             self.api_url = f"{api_host.rstrip('/')}/api/v3"
             status = self.request("system/status")
@@ -101,67 +100,33 @@ class ArrService(TelegramHandler):
                     f"Could not reach compatible api. Is the service ({self.api_url}) down? Is your API key correct?"
                 )
                 exit(1)
-            assert (
-                status
-            ), "Could not reach compatible api. Is the service down? Is your API key correct?"
+            assert status, "Could not reach compatible api. Is the service down? Is your API key correct?"
             api_version = status.get("version", "")
             assert api_version, "Could not find compatible api."
             return api_version
 
-    def get_queue_item(self, id: int):
-        return self.request(
-            f"queue/{id}",
-            params=params,
-            fallback=[],
-        )
-
     def get_queue(self, page: int = None, page_size: int = None):
         params = {}
-        if page != None:
+        if page is not None:
             params["page"] = page
-        if page_size != None:
+        if page_size is not None:
             params["page_size"] = page_size
-        return self.request(
-            "queue",
-            params=params,
-            fallback=[],
-        )
-
-    def get_queue_details(self, movie_id: int = None, include_movie: bool = None):
-        params = {}
-        if movie_id:
-            params["movieId"] = movie_id
-        if include_movie != None:
-            params["includeMovie"] = include_movie
-        return self.request(
-            "queue",
-            params=params,
-            fallback=[],
-        )
-
-    def get_queue_detail(self, id: int):
-        return self.request(
-            f"queue/details/{id}",
-            params={},
-            fallback=[],
-        )
+        return self.request("queue", params=params, fallback=[])
 
     def list_(self):
         if not self.arr_variant:
-            return NotImplementedError(
-                "Unsupported Arr variant. You have to implement your own search"
+            raise NotImplementedError(
+                "Unsupported Arr variant. You have to implement your own list"
             )
-
         return self.request(f"{self.arr_variant.value}", fallback=[])
 
     def lookup(self, term: str = None):
         if not self.arr_variant:
-            return NotImplementedError(
+            raise NotImplementedError(
                 "Unsupported Arr variant. You have to implement your own search"
             )
         if not term:
             return []
-
         return self.request(
             f"{self.arr_variant.value}/lookup",
             params={"term": term},
@@ -180,7 +145,7 @@ class ArrService(TelegramHandler):
         monitored=True,
         options={},
     ):
-        assert item, "Missing required arg! You need to provide a item!"
+        assert item, "Missing required arg! You need to provide an item!"
 
         item_id = item.get("id")
         if item_id:
@@ -206,7 +171,7 @@ class ArrService(TelegramHandler):
         )
 
     def remove(self, *, id=None):
-        assert id, "Missing required arg! You need to provide a id!"
+        assert id, "Missing required arg! You need to provide an id!"
         return self.request(
             f"{self.arr_variant.value}/{id}",
             action=Action.DELETE,

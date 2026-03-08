@@ -7,59 +7,49 @@ from functools import wraps
 from telegram.ext import CommandHandler, CallbackQueryHandler
 from typing import TypeAlias
 
-from ..config.commands import AUTH_COMMAND, HELP_COMMAND, START_COMMAND
-from ..config.secrets import ADMIN_AUTH_PASSWORD
-from ..database import Database
+from ..config.commands import HELP_COMMAND, START_COMMAND
+from .auth import is_allowed
 
 
 def escape_markdownv2_chars(text: str):
     for c in [
-        "_",
-        "*",
-        "[",
-        "]",
-        "(",
-        ")",
-        "~",
-        "`",
-        "#",
-        "+",
-        "-",
-        "=",
-        "|",
-        "{",
-        "}",
-        ".",
-        "!",
+        "_", "*", "[", "]", "(", ")", "~", "`", "#",
+        "+", "-", "=", "|", "{", "}", ".", "!",
     ]:
         text = text.replace(c, rf"\{c}")
     return text
 
 
-CmdStr: TypeAlias = str  # The command itself
-CmdPattern: TypeAlias = str  # Help text: Descriptive pattern for arguments
-CmdDescription: TypeAlias = str  # Help text: Description of command
+CmdStr: TypeAlias = str
+CmdPattern: TypeAlias = str
+CmdDescription: TypeAlias = str
 Cmd: TypeAlias = CmdStr | Tuple[CmdStr, CmdPattern, CmdDescription]
 
 
 def get_help_handler_fn(services):
-    response_message = f"""
-Welcome to *butlarr*! \n
-*butlarr* is a bot that helps you interact with various _arr_ services. \n
-To use this service you have to authorize using a password first: `/{AUTH_COMMAND} <password>`. \n
-After doing so you can interact with the various services using:
-    """
+    response_message = (
+        "Welcome to *butlarr*\\!\n\n"
+        "*butlarr* is a bot that helps you interact with various _arr_ services\\.\n\n"
+        "Available commands:\n"
+    )
     for s in services:
         for cmd in s.commands:
-            response_message += f"\n - `/{cmd} {escape_markdownv2_chars(s.default_pattern)}` \t _{escape_markdownv2_chars(s.default_description)}_"
+            response_message += (
+                f"\n \\- `/{cmd} {escape_markdownv2_chars(s.default_pattern)}`"
+                f" \\— _{escape_markdownv2_chars(s.default_description)}_"
+            )
     response_message += "\n"
-
     for s in services:
         for cmd, pattern, desc, _ in s.sub_commands:
-            response_message += f"\n - `/{s.commands[0]} {cmd} {escape_markdownv2_chars(pattern)}` \t _{escape_markdownv2_chars(desc)}_"
+            response_message += (
+                f"\n \\- `/{s.commands[0]} {cmd} {escape_markdownv2_chars(pattern)}`"
+                f" \\— _{escape_markdownv2_chars(desc)}_"
+            )
 
     async def handler(update, context):
-        await update.message.reply_text(response_message, parse_mode="Markdown")
+        if not is_allowed(update):
+            return
+        await update.message.reply_text(response_message, parse_mode="MarkdownV2")
 
     return handler
 
@@ -74,6 +64,12 @@ def get_common_handlers(services):
 
 def get_clbk_handler(services):
     async def handler(update, context):
+        if not is_allowed(update):
+            try:
+                await update.callback_query.answer()
+            except Exception:
+                pass
+            return
         args = shlex.split(update.callback_query.data.strip())
         if args[0] == "noop":
             await update.callback_query.answer()
@@ -87,17 +83,13 @@ def get_clbk_handler(services):
     return CallbackQueryHandler(handler)
 
 
-def callback(
-    cmds: List[str] = [],
-    default: bool = False,
-):
+def callback(cmds: List[str] = [], default: bool = False):
     def decorator(func):
         if default:
             func.clbk_default = True
         if cmds:
             func.clbk_cmds = cmds
         return func
-
     return decorator
 
 
@@ -112,14 +104,11 @@ def command(
             func.cmd_default = (default_description, default_pattern)
         if cmds:
             if isinstance(cmds[0], tuple):
-                assert (
-                    len(cmds[0]) == 3
-                ), "CmdTuple needs to contain pattern as well as description"
+                assert len(cmds[0]) == 3, "CmdTuple needs pattern and description"
                 func.cmd_cmds = cmds
             else:
                 func.cmd_cmds = [(cmd, "", "") for cmd in cmds]
         return func
-
     return decorator
 
 
@@ -136,10 +125,11 @@ def handler(cls):
     for method in list(cls.__dict__.values()):
         if hasattr(method, "cmd_cmds"):
             cls.sub_commands += [
-                (cmd, pattern, desc, method) for (cmd, pattern, desc) in method.cmd_cmds
+                (cmd, pattern, desc, method)
+                for (cmd, pattern, desc) in method.cmd_cmds
             ]
         if hasattr(method, "cmd_default"):
-            assert not has_default_command, f"Only one default command allowed."
+            assert not has_default_command, "Only one default command allowed."
             cls.default_command = method
             (desc, pattern) = method.cmd_default
             cls.default_description = desc
@@ -156,13 +146,11 @@ def handler(cls):
 
 
 class TelegramHandler:
-    db: Database
     commands: List[CmdStr]
     sub_commands: List[Tuple[CmdStr, CmdPattern, CmdDescription, Callable]]
     sub_callbacks: List[Tuple[str, Callable]]
 
-    def register(self, application, db):
-        self.db = db
+    def register(self, application):
         for cmd in self.commands:
             application.add_handler(CommandHandler(cmd, self.handle_command))
 
@@ -177,11 +165,10 @@ class TelegramHandler:
         if self.sub_commands and len(args) > 1:
             for s, _, _, c in self.sub_commands:
                 if args[1] == s:
-                    logger.debug(f"Subcommand - Executing {s} ({c.__name__})")
+                    logger.debug(f"Subcommand — Executing {s} ({c.__name__})")
                     await c(self, update, context, args[1:])
                     return
-
-            logger.debug("No matching subcommand registered. Trying fallback")
+            logger.debug("No matching subcommand. Trying fallback")
         try:
             await self.default_command(update, context, args[1:])
         except NotImplementedError:
@@ -198,11 +185,10 @@ class TelegramHandler:
         if self.sub_callbacks and len(args) > 1:
             for s, c in self.sub_callbacks:
                 if args[1] == s:
-                    logger.debug(f"Subcallback - Executing {s} ({c.__name__})")
+                    logger.debug(f"Subcallback — Executing {s} ({c.__name__})")
                     await c(self, update, context, args[1:])
                     return
-
-            logger.debug("No matching subcallback registered. Trying fallback")
+            logger.debug("No matching subcallback. Trying fallback")
         try:
             await self.default_callback(update, context, args[1:])
         except NotImplementedError:
@@ -210,4 +196,4 @@ class TelegramHandler:
 
     def get_clbk(self, *args: List[str]):
         args = [self.commands[0], *args]
-        return (" ").join([f'"{arg}"' for arg in args])
+        return " ".join([f'"{arg}"' for arg in args])

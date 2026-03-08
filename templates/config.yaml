@@ -1,10 +1,12 @@
-telegram: 
+telegram:
   token: "<YOUR_TELEGRAM_TOKEN>"
 
-auth_passwords:
-  admin: "<SECURE_UNIQUE_PASSWORD>"
-  mod: "<SECURE_UNIQUE_PASSWORD>"
-  user: "<SECURE_UNIQUE_PASSWORD>"
+# Whitelist of Telegram IDs allowed to use the bot.
+# User IDs are positive integers; group/supergroup chat IDs are negative.
+# To find your ID, message @userinfobot on Telegram.
+whitelist:
+  - 123456789        # user example
+  - -100987654321    # group/supergroup example
 
 apis:
   movie:

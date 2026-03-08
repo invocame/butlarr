@@ -1,89 +1,55 @@
-import shlex
-
-from typing import List, Tuple, Callable, Optional
-from loguru import logger
 from functools import wraps
-from telegram.ext import CommandHandler, CallbackQueryHandler
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest
+from loguru import logger
 
-from dataclasses import dataclass
-from typing import Any
-from enum import Enum
-
-from ..config.commands import AUTH_COMMAND
-from ..config.secrets import ADMIN_AUTH_PASSWORD, MOD_AUTH_PASSWORD, USER_AUTH_PASSWORD
-from ..database import Database
+from ..config.secrets import WHITELIST
 
 
-class AuthLevels(Enum):
-    NONE = 0
-    USER = 1
-    MOD = 2
-    ADMIN = 3
+def _get_ids(update):
+    """Return (user_id, chat_id) from either a message or callback query."""
+    if update.message:
+        return update.message.from_user.id, update.message.chat_id
+    if update.callback_query:
+        return update.callback_query.from_user.id, update.callback_query.message.chat_id
+    return None, None
 
 
-def get_auth_level_from_message(db, update):
-    uid = (
-        update.message.from_user.id
-        if update.message
-        else update.callback_query.from_user.id
-    )
-    return db.get_auth_level(uid)
+def is_allowed(update) -> bool:
+    user_id, chat_id = _get_ids(update)
+    allowed = user_id in WHITELIST or chat_id in WHITELIST
+    if not allowed:
+        logger.debug(
+            f"Ignoring update from user_id={user_id} chat_id={chat_id} — not in whitelist"
+        )
+    return allowed
 
 
-def authorized(min_auth_level=None):
-    assert min_auth_level, "Missing required arg min_auth_level"
-    min_auth_level = (
-        min_auth_level.value if isinstance(min_auth_level, Enum) else min_auth_level
-    )
+def authorized(_func=None, *, min_auth_level=None):
+    """
+    Decorator that silently ignores any interaction from users/chats
+    not present in the whitelist defined in config.yaml (or env vars).
 
+    The `min_auth_level` parameter is accepted for back-compatibility
+    but has no effect — whitelist presence is the only check.
+    """
     def decorator(func):
         @wraps(func)
         async def wrapped_func(*args, **kwargs):
-            # Ensure user is authorized
-            update = args[1] if len(args) >= 2 else kwargs["update"]
-            uid = (
-                update.message.from_user.id
-                if update.message
-                else update.callback_query.from_user.id
-            )
-            auth_level = args[0].db.get_auth_level(uid)
-            # TODO pjordan: Reenable this some time
-            if not auth_level or min_auth_level > auth_level and False:
-                await update.message.reply_text(
-                    f"User not authorized for this command. \n *Authorize using `/{AUTH_COMMAND} <password>`*",
-                    parse_mode="Markdown",
-                )
-                return
-
+            # args[0] = self (service instance), args[1] = update
+            update = args[1] if len(args) >= 2 else kwargs.get("update")
+            if not is_allowed(update):
+                # Silently ignore — answer callback queries to avoid the
+                # "loading" spinner hanging in the Telegram client.
+                if update and update.callback_query:
+                    try:
+                        await update.callback_query.answer()
+                    except Exception:
+                        pass
+                return None
             return await func(*args, **kwargs)
 
         return wrapped_func
 
+    # Support both @authorized and @authorized(min_auth_level=...)
+    if _func is not None:
+        return decorator(_func)
     return decorator
-
-
-def get_auth_handler(db: Database):
-    async def handler(update, context):
-        uid = update.message.from_user.id
-        name = update.message.from_user.name
-        pw_offset = len(AUTH_COMMAND) + 2
-        password = update.message.text[pw_offset:].strip()
-        if password == ADMIN_AUTH_PASSWORD:
-            db.add_user(uid, name, AuthLevels.ADMIN.value)
-            await update.message.reply_text(f"Authorized user {name} as admin")
-            await update.message.delete()
-        elif password == MOD_AUTH_PASSWORD:
-            db.add_user(uid, name, AuthLevels.MOD.value)
-            await update.message.reply_text(f"Authorized user {name} as mod")
-            await update.message.delete()
-        elif password == USER_AUTH_PASSWORD:
-            db.add_user(uid, name, AuthLevels.USER.value)
-            await update.message.reply_text(f"Authorized user {name}")
-            await update.message.delete()
-        else:
-            await update.message.reply_text(f"Wrong password")
-            await update.message.delete()
-
-    return CommandHandler(AUTH_COMMAND, handler)

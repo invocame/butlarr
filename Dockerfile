@@ -1,10 +1,6 @@
 FROM python:3.11-slim
 
-LABEL maintainer="butlarr"
 LABEL description="Telegram bot for Sonarr/Radarr management"
-
-# Create non-root user
-RUN groupadd -r butlarr && useradd -r -g butlarr butlarr
 
 WORKDIR /app
 
@@ -16,15 +12,13 @@ RUN pip install --no-cache-dir --upgrade pip \
 # Copy source code
 COPY butlarr/ ./butlarr/
 
-# Data directory for session storage
-RUN mkdir -p /app/data/session \
- && chown -R butlarr:butlarr /app/data
+# Pre-create data dirs so they are owned by root inside the image.
+# The volume mount will overlay /app/data at runtime — Docker will
+# preserve ownership of the host directory, so no permission issues.
+RUN mkdir -p /app/data/session
 
-# Entrypoint
 COPY scripts/docker_entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
-
-USER butlarr
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["python3", "-m", "butlarr"]

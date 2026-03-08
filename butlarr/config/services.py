@@ -1,4 +1,5 @@
 import importlib
+import traceback
 
 from . import CONFIG
 
@@ -11,8 +12,13 @@ for service in CONFIG["services"]:
             f"butlarr.services.{service['type'].lower()}"
         )
         ServiceConstructor = getattr(service_module, service["type"])
-    except Exception:
-        assert False, "Could not find a module for that service"
+    except Exception as e:
+        traceback.print_exc()
+        raise RuntimeError(
+            f"Could not load service of type '{service.get('type')}': {e}\n"
+            f"Make sure the type matches an existing module in butlarr/services/ "
+            f"(e.g. 'Radarr', 'Sonarr')."
+        ) from e
 
     api_config = APIS[service["api"]]
     args = {

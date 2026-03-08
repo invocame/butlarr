@@ -51,6 +51,7 @@ class State:
     releases: Optional[List[Any]] = field(default=None)
     release_page: int = 0
     downloaded: List[int] = field(default_factory=list)
+    info_msg_ids: List[int] = field(default_factory=list)
 
 
 @handler
@@ -110,9 +111,15 @@ class Sonarr(ExtArrService, ArrService):
                     abs_idx = start + i
                     if abs_idx in state.downloaded:
                         label = f"⬇️ {_release_button_label(r)}"
-                        rows_menu.append([Button(label, "noop")])
+                        rows_menu.append([
+                            Button(label, "noop"),
+                            Button("ℹ️", self.get_clbk("relinfo", abs_idx)),
+                        ])
                     else:
-                        rows_menu.append([Button(_release_button_label(r), self.get_clbk("dlrelease", abs_idx))])
+                        rows_menu.append([
+                            Button(_release_button_label(r), self.get_clbk("dlrelease", abs_idx)),
+                            Button("ℹ️", self.get_clbk("relinfo", abs_idx)),
+                        ])
 
                 rows_menu.append([
                     (
@@ -395,10 +402,11 @@ class Sonarr(ExtArrService, ArrService):
                     releases=None,
                     release_page=0,
                     downloaded=[],
+                    info_msg_ids=[],
                 )
                 full_redraw = True
             else:
-                state = replace(state, menu=None, releases=None, release_page=0, downloaded=[])
+                state = replace(state, menu=None, releases=None, release_page=0, downloaded=[], info_msg_ids=[])
         elif args[0] == "seasons":
             state = replace(state, menu="seasons")
         elif args[0] == "searchseason":
@@ -448,7 +456,7 @@ class Sonarr(ExtArrService, ArrService):
         if args[0] == "releases":
             item = state.items[state.index]
             releases = self.get_releases(seriesId=item["id"])
-            state = replace(state, menu="releases", releases=releases, release_page=0, downloaded=[])
+            state = replace(state, menu="releases", releases=releases, release_page=0, downloaded=[], info_msg_ids=[])
         elif args[0] == "relpage":
             state = replace(state, release_page=int(args[1]))
         return self.create_message(state)
@@ -484,6 +492,7 @@ class Sonarr(ExtArrService, ArrService):
             releases=releases,
             release_page=0,
             downloaded=[],
+            info_msg_ids=[],
             seasons=self._get_season_state(result),
         )
         self.session_db.add_session_entry(default_session_state_key_fn(self, update), state)
@@ -545,11 +554,67 @@ class Sonarr(ExtArrService, ArrService):
         self.session_db.add_session_entry(default_session_state_key_fn(self, update), state)
         return self.create_message(state, full_redraw=True)
 
+    @callback(cmds=["relinfo"])
+    @authorized
+    async def clbk_relinfo(self, update, context, args):
+        key = default_session_state_key_fn(self, update)
+        state = self.session_db.get_session_entry(key)
+
+        idx = int(args[1])
+        releases = state.releases or []
+        if idx >= len(releases):
+            await update.callback_query.answer()
+            return
+
+        r = releases[idx]
+        title = r.get("title", "Unknown")
+        quality = r.get("quality", {}).get("quality", {}).get("name", "?")
+        size = format_size(r.get("size", 0))
+        seeders = r.get("seeders")
+        peers = r.get("leechers")
+        indexer = r.get("indexer", "?")
+        approved = "✅ Approved" if r.get("approved") else "⚠️ Not approved"
+
+        lines = [
+            f"📄 *Release info*",
+            f"`{title}`",
+            f"",
+            f"Quality: {quality}",
+            f"Size: {size}",
+        ]
+        if seeders is not None:
+            lines.append(f"Seeders: {seeders}  Peers: {peers if peers is not None else '?'}")
+        lines += [
+            f"Indexer: {indexer}",
+            f"Status: {approved}",
+        ]
+        if r.get("rejections"):
+            lines.append(f"Rejections: {', '.join(r['rejections'])}")
+
+        chat_id = update.callback_query.message.chat_id
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text="\n".join(lines),
+            parse_mode="Markdown",
+        )
+        await update.callback_query.answer()
+
+        new_state = replace(state, info_msg_ids=[*state.info_msg_ids, msg.message_id])
+        self.session_db.add_session_entry(key, new_state)
+
     @clear
     @callback(cmds=["done"])
     @sessionState(clear=True)
     @authorized
     async def clbk_done(self, update, context, args, state):
+        # Delete all info messages
+        chat_id = update.callback_query.message.chat_id
+        for mid in state.info_msg_ids or []:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+            except Exception:
+                pass
+
         downloaded = state.downloaded or []
         releases = state.releases or []
         if not downloaded:

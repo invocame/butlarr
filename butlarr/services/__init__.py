@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from loguru import logger
 from enum import Enum
-from typing import List, Tuple, Optional, Any
+from typing import List
 import requests
 from ..tg_handler import TelegramHandler
 from ..session_database import SessionDatabase
@@ -16,6 +16,16 @@ def find_first(elems, check, fallback=0):
         if not result and elems:
             return elems[fallback]
         return result
+
+
+def format_size(size_bytes: int) -> str:
+    """Human-readable file size."""
+    if not size_bytes:
+        return "?"
+    gb = size_bytes / (1024 ** 3)
+    if gb >= 1:
+        return f"{gb:.1f} GB"
+    return f"{size_bytes / (1024 ** 2):.0f} MB"
 
 
 class Action(Enum):
@@ -42,7 +52,7 @@ class ArrService(TelegramHandler):
     api_key: str
     api_version: str
     service_content: ServiceContent = None
-    arr_variant: ArrVariant | str = None
+    arr_variant: ArrVariant = None
 
     root_folders: List[str] = []
     session_db: SessionDatabase = SessionDatabase()
@@ -97,10 +107,11 @@ class ArrService(TelegramHandler):
         finally:
             if status is None:
                 logger.error(
-                    f"Could not reach compatible api. Is the service ({self.api_url}) down? Is your API key correct?"
+                    f"Could not reach compatible api. Is the service ({self.api_url}) down? "
+                    f"Is your API key correct?"
                 )
                 exit(1)
-            assert status, "Could not reach compatible api. Is the service down? Is your API key correct?"
+            assert status, "Could not reach compatible api."
             api_version = status.get("version", "")
             assert api_version, "Could not find compatible api."
             return api_version
@@ -177,10 +188,35 @@ class ArrService(TelegramHandler):
             action=Action.DELETE,
         )
 
+    def get_releases(self, **params) -> List:
+        """
+        Fetch available releases (torrents/nzbs) from all configured indexers.
+        Pass movieId=<id> for Radarr or seriesId=<id> for Sonarr.
+        Results are sorted: approved first, then by seeders descending.
+        """
+        releases = self.request("release", params=params, fallback=[])
+        if not releases:
+            return []
+        releases.sort(
+            key=lambda r: (
+                not r.get("approved", False),
+                -(r.get("seeders") or 0),
+            )
+        )
+        return releases
+
+    def download_release(self, guid: str, indexer_id: int):
+        """Force-download a specific release by its guid."""
+        return self.request(
+            "release",
+            action=Action.POST,
+            params={"guid": guid, "indexerId": indexer_id},
+        )
+
     def get_root_folders(self) -> List[str]:
         return self.request("rootfolder", fallback=[])
 
-    def get_root_folder(self, id: str) -> List[str]:
+    def get_root_folder(self, id: str):
         return self.request(f"rootfolder/{id}", fallback={})
 
     def get_tags(self):

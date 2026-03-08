@@ -1,14 +1,32 @@
+import math
 from loguru import logger
 from typing import Optional, List, Any, Literal
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, field
 
-from . import ArrService, ArrVariant, Action, ServiceContent, find_first
+from . import ArrService, ArrVariant, Action, ServiceContent, find_first, format_size
 from .ext import ExtArrService
 from ..tg_handler import command, callback, handler
 from ..tg_handler.message import Response, repaint, clear
 from ..tg_handler.auth import authorized
 from ..tg_handler.session_state import sessionState, default_session_state_key_fn
 from ..tg_handler.keyboard import Button, keyboard
+
+RELEASES_PER_PAGE = 5
+
+
+def _release_button_label(r: dict) -> str:
+    """Single-line label for a release Telegram button."""
+    approved = "✅" if r.get("approved") else "⚠️"
+    quality = r.get("quality", {}).get("quality", {}).get("name", "?")
+    size = format_size(r.get("size", 0))
+    seeders = r.get("seeders")
+    peers = r.get("leechers")
+    sp = ""
+    if seeders is not None and peers is not None:
+        sp = f"  S:{seeders} P:{peers}"
+    elif seeders is not None:
+        sp = f"  S:{seeders}"
+    return f"{approved} {quality}  {size}{sp}"
 
 
 @dataclass(frozen=True)
@@ -21,15 +39,17 @@ class SeasonState:
 class State:
     items: List[Any]
     index: int
-    quality_profile: str
-    language_profile: str
+    quality_profile: Any
+    language_profile: Any
     tags: List[str]
-    root_folder: str
+    root_folder: Any
     seasons: SeasonState
     menu: Optional[
         Literal["path"] | Literal["tags"] | Literal["quality"]
-        | Literal["language"] | Literal["add"]
+        | Literal["language"] | Literal["add"] | Literal["releases"]
     ]
+    releases: Optional[List[Any]] = field(default=None)
+    release_page: int = 0
 
 
 @handler
@@ -71,7 +91,37 @@ class Sonarr(ExtArrService, ArrService):
         in_library = "id" in item and item["id"]
 
         rows_menu = []
-        if state.menu == "add":
+
+        # ── Releases picker ───────────────────────────────────────────────────
+        if state.menu == "releases":
+            row_navigation = [Button("=== Available Releases ===", "noop")]
+            releases = state.releases or []
+
+            if not releases:
+                rows_menu = [[Button("No releases found", "noop")]]
+            else:
+                total_pages = math.ceil(len(releases) / RELEASES_PER_PAGE)
+                start = state.release_page * RELEASES_PER_PAGE
+                page_releases = releases[start: start + RELEASES_PER_PAGE]
+
+                rows_menu = [
+                    [Button(_release_button_label(r), self.get_clbk("dlrelease", start + i))]
+                    for i, r in enumerate(page_releases)
+                ]
+                rows_menu.append([
+                    (
+                        Button("◀ Prev", self.get_clbk("relpage", state.release_page - 1))
+                        if state.release_page > 0 else Button()
+                    ),
+                    Button(f"{state.release_page + 1} / {total_pages}", "noop"),
+                    (
+                        Button("Next ▶", self.get_clbk("relpage", state.release_page + 1))
+                        if state.release_page + 1 < total_pages else Button()
+                    ),
+                ])
+
+        # ── Add / edit menu ───────────────────────────────────────────────────
+        elif state.menu == "add":
             row_navigation = [
                 Button("=== Editing Series ===" if in_library else "=== Adding Series ===", "noop")
             ]
@@ -89,6 +139,8 @@ class Sonarr(ExtArrService, ArrService):
                     self.get_clbk("language", state.index),
                 )],
             ]
+
+        # ── Season search ─────────────────────────────────────────────────────
         elif state.menu == "seasons":
             row_navigation = [Button("=== Search for Seasons ===")]
             rows_menu = [
@@ -98,24 +150,32 @@ class Sonarr(ExtArrService, ArrService):
                 )]
                 for sid in state.seasons.available
             ]
+
+        # ── Path selector ─────────────────────────────────────────────────────
         elif state.menu == "path":
             row_navigation = [Button("=== Selecting Root Folder ===")]
             rows_menu = [
                 [Button(p.get("path", "-"), self.get_clbk("selectpath", p.get("id")))]
                 for p in self.root_folders
             ]
+
+        # ── Quality selector ──────────────────────────────────────────────────
         elif state.menu == "quality":
             row_navigation = [Button("=== Selecting Quality Profile ===")]
             rows_menu = [
                 [Button(p.get("name", "-"), self.get_clbk("selectquality", p.get("id")))]
                 for p in self.quality_profiles
             ]
+
+        # ── Language selector ─────────────────────────────────────────────────
         elif state.menu == "language":
             row_navigation = [Button("=== Selecting Language Profile ===")]
             rows_menu = [
                 [Button(p.get("name", "-"), self.get_clbk("selectlanguage", p.get("id")))]
                 for p in self.language_profiles
             ]
+
+        # ── Default view ──────────────────────────────────────────────────────
         else:
             if in_library:
                 monitored = item.get("monitored", True)
@@ -133,7 +193,7 @@ class Sonarr(ExtArrService, ArrService):
                     if state.index > 0 else Button()
                 ),
                 (
-                    Button("TMDB", url=f"https://www.themoviedb.org/tv/{item['tvdbId']}")
+                    Button("TVDB", url=f"https://www.thetvdb.com/?id={item['tvdbId']}&tab=series")
                     if item.get("tvdbId") else None
                 ),
                 (
@@ -146,20 +206,26 @@ class Sonarr(ExtArrService, ArrService):
                 ),
             ]
 
+        # ── Action rows ───────────────────────────────────────────────────────
         rows_action = []
         if in_library:
-            if state.menu != "add":
-                rows_action.append([
-                    Button("🗑 Remove", self.get_clbk("remove")),
-                    Button("✏️ Edit", self.get_clbk("addmenu")),
-                ])
-            else:
+            if state.menu == "releases":
+                pass  # back button handled below
+            elif state.menu == "add":
                 rows_action.append([
                     Button("🗑 Remove", self.get_clbk("remove")),
                     Button("✅ Submit", self.get_clbk("add", "no-search")),
                 ])
                 rows_action.append([
                     Button("✅ + 🔍 Submit & Search", self.get_clbk("add", "search")),
+                ])
+            else:
+                rows_action.append([
+                    Button("🎯 Pick Release", self.get_clbk("releases")),
+                ])
+                rows_action.append([
+                    Button("🗑 Remove", self.get_clbk("remove")),
+                    Button("✏️ Edit", self.get_clbk("addmenu")),
                 ])
         else:
             if not state.menu:
@@ -174,7 +240,7 @@ class Sonarr(ExtArrService, ArrService):
                 ])
 
         back_target = (
-            "goto" if state.menu in ("seasons", "add")
+            "goto" if state.menu in ("seasons", "add", "releases")
             else "addmenu" if state.menu else "goto"
         )
         if state.menu:
@@ -237,6 +303,8 @@ class Sonarr(ExtArrService, ArrService):
             seasons=self._get_season_state(items[0]) if items else SeasonState([], []),
         )
 
+    # ── Commands ──────────────────────────────────────────────────────────────
+
     @repaint
     @command(
         default=True,
@@ -280,6 +348,8 @@ class Sonarr(ExtArrService, ArrService):
         self.session_db.add_session_entry(default_session_state_key_fn(self, update), state)
         return self.create_message(state, full_redraw=True)
 
+    # ── Callbacks ─────────────────────────────────────────────────────────────
+
     @repaint
     @callback(cmds=[
         "goto", "tags", "addtag", "remtag", "seasons", "searchseason",
@@ -308,10 +378,12 @@ class Sonarr(ExtArrService, ArrService):
                     tags=item.get("tags", []),
                     menu=None,
                     seasons=self._get_season_state(item),
+                    releases=None,
+                    release_page=0,
                 )
                 full_redraw = True
             else:
-                state = replace(state, menu=None)
+                state = replace(state, menu=None, releases=None, release_page=0)
         elif args[0] == "seasons":
             state = replace(state, menu="seasons")
         elif args[0] == "searchseason":
@@ -352,6 +424,40 @@ class Sonarr(ExtArrService, ArrService):
             state = replace(state, menu="add")
 
         return self.create_message(state, full_redraw=full_redraw)
+
+    @repaint
+    @callback(cmds=["releases", "relpage"])
+    @sessionState()
+    @authorized
+    async def clbk_releases(self, update, context, args, state):
+        if args[0] == "releases":
+            item = state.items[state.index]
+            releases = self.get_releases(seriesId=item["id"])
+            state = replace(state, menu="releases", releases=releases, release_page=0)
+        elif args[0] == "relpage":
+            state = replace(state, release_page=int(args[1]))
+        return self.create_message(state)
+
+    @clear
+    @callback(cmds=["dlrelease"])
+    @sessionState(clear=True)
+    @authorized
+    async def clbk_dlrelease(self, update, context, args, state):
+        idx = int(args[1])
+        releases = state.releases or []
+        if idx >= len(releases):
+            return Response(caption="Release no longer available.")
+
+        release = releases[idx]
+        result = self.download_release(
+            guid=release["guid"],
+            indexer_id=release.get("indexerId", 0),
+        )
+        if not result:
+            return Response(caption="Something went wrong — could not start the download.")
+
+        title = release.get("title", "Unknown")[:60]
+        return Response(caption=f"⬇️ Downloading:\n{title}")
 
     @clear
     @callback(cmds=["add"])

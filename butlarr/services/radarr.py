@@ -1,50 +1,89 @@
+import math
 from loguru import logger
 from typing import Optional, List, Any, Literal
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, field
 
-from . import ArrService, ArrVariant, Action, ServiceContent, find_first
-from .ext import ExtArrService, QueueState
+from . import ArrService, ArrVariant, Action, ServiceContent, find_first, format_size
+from .ext import ExtArrService
 from ..tg_handler import command, callback, handler
 from ..tg_handler.message import Response, repaint, clear
 from ..tg_handler.auth import authorized
 from ..tg_handler.session_state import sessionState, default_session_state_key_fn
 from ..tg_handler.keyboard import Button, keyboard
 
+RELEASES_PER_PAGE = 5
+
+
+def _release_button_label(r: dict) -> str:
+    """Single-line label for a release Telegram button."""
+    approved = "✅" if r.get("approved") else "⚠️"
+    quality = r.get("quality", {}).get("quality", {}).get("name", "?")
+    size = format_size(r.get("size", 0))
+    seeders = r.get("seeders")
+    peers = r.get("leechers")
+    sp = ""
+    if seeders is not None and peers is not None:
+        sp = f"  S:{seeders} P:{peers}"
+    elif seeders is not None:
+        sp = f"  S:{seeders}"
+    return f"{approved} {quality}  {size}{sp}"
+
+
+@dataclass(frozen=True)
+class SeasonState:
+    available: List[int]
+    selected: List[int]
+
 
 @dataclass(frozen=True)
 class State:
     items: List[Any]
     index: int
-    quality_profile: str
+    quality_profile: Any
+    language_profile: Any
     tags: List[str]
-    root_folder: str
+    root_folder: Any
+    seasons: SeasonState
     menu: Optional[
-        Literal["path"] | Literal["tags"] | Literal["quality_profile"] | Literal["add"]
+        Literal["path"] | Literal["tags"] | Literal["quality"]
+        | Literal["language"] | Literal["add"] | Literal["releases"]
     ]
+    releases: Optional[List[Any]] = field(default=None)
+    release_page: int = 0
 
 
 @handler
-class Radarr(ExtArrService, ArrService):
+class Sonarr(ExtArrService, ArrService):
     def __init__(self, commands: List[str], api_host: str, api_key: str):
         self.commands = commands
         self.api_key = api_key
 
         self.api_version = self.detect_api(api_host)
-        self.service_content = ServiceContent.MOVIE
-        self.arr_variant = ArrVariant.RADARR
+        self.service_content = ServiceContent.SERIES
+        self.arr_variant = ArrVariant.SONARR
         self.root_folders = self.get_root_folders()
         self.quality_profiles = self.get_quality_profiles()
+        self.language_profiles = self.get_language_profiles()
 
         if not self.root_folders:
             logger.warning(
                 "No root folders configured! Please configure root folders inside the "
-                "Radarr interface. Otherwise Butlarr might not behave as expected."
+                "Sonarr interface. Otherwise Butlarr might not behave as expected."
             )
         if not self.quality_profiles:
             logger.warning(
                 "No quality profiles configured! Please configure quality profiles inside "
-                "the Radarr interface. Otherwise Butlarr might not behave as expected."
+                "the Sonarr interface. Otherwise Butlarr might not behave as expected."
             )
+        if not self.language_profiles:
+            logger.warning(
+                "No language profiles configured! Please configure language profiles inside "
+                "the Sonarr interface. Otherwise Butlarr might not behave as expected."
+            )
+
+    def _get_season_state(self, item):
+        available_seasons = [e.get("seasonNumber") for e in item.get("seasons", [])]
+        return SeasonState(available=available_seasons, selected=[])
 
     @keyboard
     def keyboard(self, state: State):
@@ -52,9 +91,39 @@ class Radarr(ExtArrService, ArrService):
         in_library = "id" in item and item["id"]
 
         rows_menu = []
-        if state.menu == "add":
+
+        # ── Releases picker ───────────────────────────────────────────────────
+        if state.menu == "releases":
+            row_navigation = [Button("=== Available Releases ===", "noop")]
+            releases = state.releases or []
+
+            if not releases:
+                rows_menu = [[Button("No releases found", "noop")]]
+            else:
+                total_pages = math.ceil(len(releases) / RELEASES_PER_PAGE)
+                start = state.release_page * RELEASES_PER_PAGE
+                page_releases = releases[start: start + RELEASES_PER_PAGE]
+
+                rows_menu = [
+                    [Button(_release_button_label(r), self.get_clbk("dlrelease", start + i))]
+                    for i, r in enumerate(page_releases)
+                ]
+                rows_menu.append([
+                    (
+                        Button("◀ Prev", self.get_clbk("relpage", state.release_page - 1))
+                        if state.release_page > 0 else Button()
+                    ),
+                    Button(f"{state.release_page + 1} / {total_pages}", "noop"),
+                    (
+                        Button("Next ▶", self.get_clbk("relpage", state.release_page + 1))
+                        if state.release_page + 1 < total_pages else Button()
+                    ),
+                ])
+
+        # ── Add / edit menu ───────────────────────────────────────────────────
+        elif state.menu == "add":
             row_navigation = [
-                Button("=== Editing Movie ===" if in_library else "=== Adding Movie ===", "noop")
+                Button("=== Editing Series ===" if in_library else "=== Adding Series ===", "noop")
             ]
             rows_menu = [
                 [Button(
@@ -65,35 +134,67 @@ class Radarr(ExtArrService, ArrService):
                     f"Change Path   ({state.root_folder.get('path', '-')})",
                     self.get_clbk("path", state.index),
                 )],
+                [Button(
+                    f"Change Language   ({state.language_profile.get('name', '-')})",
+                    self.get_clbk("language", state.index),
+                )],
             ]
+
+        # ── Season search ─────────────────────────────────────────────────────
+        elif state.menu == "seasons":
+            row_navigation = [Button("=== Search for Seasons ===")]
+            rows_menu = [
+                [Button(
+                    f"{'✔' if sid in state.seasons.selected else '🔍'} Season {sid}",
+                    self.get_clbk("noop" if sid in state.seasons.selected else "searchseason", sid),
+                )]
+                for sid in state.seasons.available
+            ]
+
+        # ── Path selector ─────────────────────────────────────────────────────
         elif state.menu == "path":
             row_navigation = [Button("=== Selecting Root Folder ===")]
             rows_menu = [
                 [Button(p.get("path", "-"), self.get_clbk("selectpath", p.get("id")))]
                 for p in self.root_folders
             ]
+
+        # ── Quality selector ──────────────────────────────────────────────────
         elif state.menu == "quality":
             row_navigation = [Button("=== Selecting Quality Profile ===")]
             rows_menu = [
                 [Button(p.get("name", "-"), self.get_clbk("selectquality", p.get("id")))]
                 for p in self.quality_profiles
             ]
+
+        # ── Language selector ─────────────────────────────────────────────────
+        elif state.menu == "language":
+            row_navigation = [Button("=== Selecting Language Profile ===")]
+            rows_menu = [
+                [Button(p.get("name", "-"), self.get_clbk("selectlanguage", p.get("id")))]
+                for p in self.language_profiles
+            ]
+
+        # ── Default view ──────────────────────────────────────────────────────
         else:
             if in_library:
                 monitored = item.get("monitored", True)
                 missing = not item.get("hasFile", False)
-                rows_menu = [[
-                    Button("📺 Monitored" if monitored else "Unmonitored"),
-                    Button("💾 Missing" if missing else "Downloaded"),
-                ]]
+                rows_menu = [
+                    [Button("🔍 Search for Seasons", self.get_clbk("seasons", state.index))],
+                    [
+                        Button("📺 Monitored" if monitored else "Unmonitored"),
+                        Button("💾 Missing" if missing else "Downloaded"),
+                    ],
+                ]
             row_navigation = [
                 (
                     Button("⬅ Prev", self.get_clbk("goto", state.index - 1))
                     if state.index > 0 else Button()
                 ),
                 (
-                    Button("TMDB", url=f"https://www.themoviedb.org/movie/{item['tmdbId']}")
-                    if item.get("tmdbId") else None
+                    Button("TVDB", url=f"https://www.thetvdb.com/?id={item['tvdbId']}&tab=series")
+                    if item.get("tvdbId") else None
                 ),
                 (
                     Button("IMDB", url=f"https://imdb.com/title/{item['imdbId']}")
@@ -105,14 +206,12 @@ class Radarr(ExtArrService, ArrService):
                 ),
             ]
 
+        # ── Action rows ───────────────────────────────────────────────────────
         rows_action = []
         if in_library:
-            if state.menu != "add":
-                rows_action.append([
-                    Button("🗑 Remove", self.get_clbk("remove")),
-                    Button("✏️ Edit", self.get_clbk("addmenu")),
-                ])
-            else:
+            if state.menu == "releases":
+                pass  # back button handled below
+            elif state.menu == "add":
                 rows_action.append([
                     Button("🗑 Remove", self.get_clbk("remove")),
                     Button("✅ Submit", self.get_clbk("add", "no-search")),
@@ -120,17 +219,32 @@ class Radarr(ExtArrService, ArrService):
                 rows_action.append([
                     Button("✅ + 🔍 Submit & Search", self.get_clbk("add", "search")),
                 ])
+            else:
+                rows_action.append([
+                    Button("🎯 Pick Release", self.get_clbk("releases")),
+                ])
+                rows_action.append([
+                    Button("🗑 Remove", self.get_clbk("remove")),
+                    Button("✏️ Edit", self.get_clbk("addmenu")),
+                ])
         else:
             if not state.menu:
                 rows_action.append([Button("➕ Add", self.get_clbk("addmenu"))])
             elif state.menu == "add":
                 rows_action.append([
-                    Button("📺 Monitor", self.get_clbk("add", "no-search")),
+                    Button("📚 Add (No Monitor)", self.get_clbk("add", "no-monitor")),
+                ])
+                rows_action.append([
+                    Button("📺 Monitor All", self.get_clbk("add", "no-search")),
                     Button("🔍 Monitor & Search", self.get_clbk("add", "search")),
                 ])
 
+        back_target = (
+            "goto" if state.menu in ("seasons", "add", "releases")
+            else "addmenu" if state.menu else "goto"
+        )
         if state.menu:
-            rows_action.append([Button("🔙 Back", self.get_clbk("goto"))])
+            rows_action.append([Button("🔙 Back", self.get_clbk(back_target))])
         else:
             rows_action.append([Button("❌ Cancel", self.get_clbk("cancel"))])
 
@@ -138,7 +252,7 @@ class Radarr(ExtArrService, ArrService):
 
     def create_message(self, state: State, full_redraw=False):
         if not state.items:
-            return Response(caption="No movies found", state=state)
+            return Response(caption="No series found", state=state)
 
         item = state.items[state.index]
         keyboard_markup = self.keyboard(state)
@@ -178,16 +292,25 @@ class Radarr(ExtArrService, ArrService):
                     lambda x: items[0].get("qualityProfileId") == x.get("id"),
                 ) if items else None
             ),
+            language_profile=(
+                find_first(
+                    self.language_profiles,
+                    lambda x: items[0].get("languageProfileId") == x.get("id"),
+                ) if items else None
+            ),
             tags=items[0].get("tags", []) if items else [],
             menu=None,
+            seasons=self._get_season_state(items[0]) if items else SeasonState([], []),
         )
+
+    # ── Commands ──────────────────────────────────────────────────────────────
 
     @repaint
     @command(
         default=True,
         default_pattern="<title>",
-        default_description="Search for a movie",
-        cmds=[("search", "<title>", "Search for a movie")],
+        default_description="Search for a series",
+        cmds=[("search", "<title>", "Search for a series")],
     )
     @sessionState(init=True)
     @authorized
@@ -200,24 +323,15 @@ class Radarr(ExtArrService, ArrService):
         self.session_db.add_session_entry(default_session_state_key_fn(self, update), state)
         return self.create_message(state, full_redraw=True)
 
-    @command(cmds=[("help", "", "Shows only the radarr help page")])
+    @command(cmds=[("help", "", "Shows only the sonarr help page")])
     async def cmd_help(self, update, context, args):
         return await ExtArrService.cmd_help(self, update, context, args)
 
     @repaint
-    @command(cmds=[("queue", "", "Shows the radarr download queue")])
+    @command(cmds=[("queue", "", "Shows the sonarr download queue")])
     @authorized
     async def cmd_queue(self, update, context, args):
         return await ExtArrService.cmd_queue(self, update, context, args)
-
-    @repaint
-    @command(cmds=[("list", "", "List all movies in the library")])
-    @authorized
-    async def cmd_list(self, update, context, args):
-        items = self.list_()
-        state = self._get_initial_state(items)
-        self.session_db.add_session_entry(default_session_state_key_fn(self, update), state)
-        return self.create_message(state, full_redraw=True)
 
     @repaint
     @callback(cmds=["queue"])
@@ -226,9 +340,21 @@ class Radarr(ExtArrService, ArrService):
         return await ExtArrService.clbk_queue(self, update, context, args)
 
     @repaint
+    @command(cmds=[("list", "", "List all series in the library")])
+    @authorized
+    async def cmd_list(self, update, context, args):
+        items = self.list_()
+        state = self._get_initial_state(items)
+        self.session_db.add_session_entry(default_session_state_key_fn(self, update), state)
+        return self.create_message(state, full_redraw=True)
+
+    # ── Callbacks ─────────────────────────────────────────────────────────────
+
+    @repaint
     @callback(cmds=[
-        "goto", "tags", "addtag", "remtag", "path",
-        "selectpath", "quality", "selectquality", "addmenu",
+        "goto", "tags", "addtag", "remtag", "seasons", "searchseason",
+        "path", "selectpath", "quality", "selectquality",
+        "language", "selectlanguage", "addmenu",
     ])
     @sessionState()
     @authorized
@@ -251,10 +377,28 @@ class Radarr(ExtArrService, ArrService):
                     ),
                     tags=item.get("tags", []),
                     menu=None,
+                    seasons=self._get_season_state(item),
+                    releases=None,
+                    release_page=0,
                 )
                 full_redraw = True
             else:
-                state = replace(state, menu=None)
+                state = replace(state, menu=None, releases=None, release_page=0)
+        elif args[0] == "seasons":
+            state = replace(state, menu="seasons")
+        elif args[0] == "searchseason":
+            item = state.items[state.index]
+            self.request(
+                "command",
+                action=Action.POST,
+                params={
+                    "name": "SeasonSearch",
+                    "seriesId": item.get("id"),
+                    "seasonNumber": int(args[1]),
+                },
+            )
+            season_state = replace(state.seasons, selected=[*state.seasons.selected, int(args[1])])
+            state = replace(state, seasons=season_state)
         elif args[0] == "tags":
             state = replace(state, tags=[], menu="tags")
         elif args[0] == "addtag":
@@ -271,10 +415,49 @@ class Radarr(ExtArrService, ArrService):
         elif args[0] == "selectquality":
             quality_profile = self.get_quality_profile(args[1])
             state = replace(state, quality_profile=quality_profile, menu="add")
+        elif args[0] == "language":
+            state = replace(state, menu="language")
+        elif args[0] == "selectlanguage":
+            language_profile = self.get_language_profile(args[1])
+            state = replace(state, language_profile=language_profile, menu="add")
         elif args[0] == "addmenu":
             state = replace(state, menu="add")
 
         return self.create_message(state, full_redraw=full_redraw)
+
+    @repaint
+    @callback(cmds=["releases", "relpage"])
+    @sessionState()
+    @authorized
+    async def clbk_releases(self, update, context, args, state):
+        if args[0] == "releases":
+            item = state.items[state.index]
+            releases = self.get_releases(seriesId=item["id"])
+            state = replace(state, menu="releases", releases=releases, release_page=0)
+        elif args[0] == "relpage":
+            state = replace(state, release_page=int(args[1]))
+        return self.create_message(state)
+
+    @clear
+    @callback(cmds=["dlrelease"])
+    @sessionState(clear=True)
+    @authorized
+    async def clbk_dlrelease(self, update, context, args, state):
+        idx = int(args[1])
+        releases = state.releases or []
+        if idx >= len(releases):
+            return Response(caption="Release no longer available.")
+
+        release = releases[idx]
+        result = self.download_release(
+            guid=release["guid"],
+            indexer_id=release.get("indexerId", 0),
+        )
+        if not result:
+            return Response(caption="Something went wrong — could not start the download.")
+
+        title = release.get("title", "Unknown")[:60]
+        return Response(caption=f"⬇️ Downloading:\n{title}")
 
     @clear
     @callback(cmds=["add"])
@@ -283,15 +466,21 @@ class Radarr(ExtArrService, ArrService):
     async def clbk_add(self, update, context, args, state):
         result = self.add(
             item=state.items[state.index],
-            quality_profile_id=state.quality_profile.get("id"),
-            root_folder_path=state.root_folder.get("path"),
+            quality_profile_id=state.quality_profile.get("id", 0),
+            language_profile_id=state.language_profile.get("id", 0),
+            root_folder_path=state.root_folder.get("path", ""),
             tags=state.tags,
-            options={"addOptions": {"searchForMovie": args[1] == "search"}},
+            options={
+                "addOptions": {
+                    "searchForMissingEpisodes": args[1] == "search",
+                    "monitor": "none" if args[1] == "no-monitor" else "all",
+                },
+            },
         )
         if not result:
             return Response(caption="Seems like something went wrong...")
         return Response(
-            caption="Movie updated!" if state.items[state.index].get("id") else "Movie added!"
+            caption="Series updated!" if state.items[state.index].get("id") else "Series added!"
         )
 
     @clear
@@ -307,4 +496,4 @@ class Radarr(ExtArrService, ArrService):
     @authorized
     async def clbk_remove(self, update, context, args, state):
         self.remove(id=state.items[state.index].get("id"))
-        return Response(caption="Movie removed!")
+        return Response(caption="Series removed!")

@@ -41,6 +41,7 @@ class State:
     ]
     releases: Optional[List[Any]] = field(default=None)
     release_page: int = 0
+    downloaded: List[int] = field(default_factory=list)  # indices of releases sent to download
 
 
 @handler
@@ -85,10 +86,15 @@ class Radarr(ExtArrService, ArrService):
                 start = state.release_page * RELEASES_PER_PAGE
                 page_releases = releases[start: start + RELEASES_PER_PAGE]
 
-                rows_menu = [
-                    [Button(_release_button_label(r), self.get_clbk("dlrelease", start + i))]
-                    for i, r in enumerate(page_releases)
-                ]
+                rows_menu = []
+                for i, r in enumerate(page_releases):
+                    abs_idx = start + i
+                    if abs_idx in state.downloaded:
+                        label = f"⬇️ {_release_button_label(r)}"
+                        rows_menu.append([Button(label, "noop")])
+                    else:
+                        rows_menu.append([Button(_release_button_label(r), self.get_clbk("dlrelease", abs_idx))])
+
                 rows_menu.append([
                     (
                         Button("◀ Prev", self.get_clbk("relpage", state.release_page - 1))
@@ -165,7 +171,7 @@ class Radarr(ExtArrService, ArrService):
         rows_action = []
         if in_library:
             if state.menu == "releases":
-                pass  # back button handled below
+                rows_action.append([Button("✅ Done", self.get_clbk("cancel"))])
             elif state.menu == "add":
                 rows_action.append([
                     Button("🗑 Remove", self.get_clbk("remove")),
@@ -190,10 +196,15 @@ class Radarr(ExtArrService, ArrService):
                     Button("📺 Monitor", self.get_clbk("add", "no-search")),
                     Button("🔍 Monitor & Search", self.get_clbk("add", "search")),
                 ])
+                rows_action.append([
+                    Button("🎯 Monitor & Pick", self.get_clbk("monitorpick")),
+                ])
+            elif state.menu == "releases":
+                rows_action.append([Button("✅ Done", self.get_clbk("cancel"))])
 
-        if state.menu:
+        if state.menu and state.menu != "releases":
             rows_action.append([Button("🔙 Back", self.get_clbk("goto"))])
-        else:
+        elif not state.menu:
             rows_action.append([Button("❌ Cancel", self.get_clbk("cancel"))])
 
         return [row_navigation, *rows_menu, *rows_action]
@@ -242,6 +253,9 @@ class Radarr(ExtArrService, ArrService):
             ),
             tags=items[0].get("tags", []) if items else [],
             menu=None,
+            releases=None,
+            release_page=0,
+            downloaded=[],
         )
 
     # ── Commands ──────────────────────────────────────────────────────────────
@@ -319,10 +333,11 @@ class Radarr(ExtArrService, ArrService):
                     menu=None,
                     releases=None,
                     release_page=0,
+                    downloaded=[],
                 )
                 full_redraw = True
             else:
-                state = replace(state, menu=None, releases=None, release_page=0)
+                state = replace(state, menu=None, releases=None, release_page=0, downloaded=[])
         elif args[0] == "tags":
             state = replace(state, tags=[], menu="tags")
         elif args[0] == "addtag":
@@ -350,23 +365,51 @@ class Radarr(ExtArrService, ArrService):
     @authorized
     async def clbk_releases(self, update, context, args, state):
         if args[0] == "releases":
-            # Fetch releases from Radarr — may take a second
             item = state.items[state.index]
             releases = self.get_releases(movieId=item["id"])
-            state = replace(state, menu="releases", releases=releases, release_page=0)
+            state = replace(state, menu="releases", releases=releases, release_page=0, downloaded=[])
         elif args[0] == "relpage":
             state = replace(state, release_page=int(args[1]))
         return self.create_message(state)
 
-    @clear
+    @repaint
+    @callback(cmds=["monitorpick"])
+    @sessionState()
+    @authorized
+    async def clbk_monitorpick(self, update, context, args, state):
+        result = self.add(
+            item=state.items[state.index],
+            quality_profile_id=state.quality_profile.get("id"),
+            root_folder_path=state.root_folder.get("path"),
+            tags=state.tags,
+            options={"addOptions": {"searchForMovie": False}},
+        )
+        if not result:
+            return Response(caption="Could not add the movie.", state=state)
+
+        new_items = list(state.items)
+        new_items[state.index] = result
+        releases = self.get_releases(movieId=result["id"])
+        state = replace(
+            state,
+            items=new_items,
+            menu="releases",
+            releases=releases,
+            release_page=0,
+            downloaded=[],
+        )
+        self.session_db.add_session_entry(default_session_state_key_fn(self, update), state)
+        return self.create_message(state, full_redraw=True)
+
+    @repaint
     @callback(cmds=["dlrelease"])
-    @sessionState(clear=True)
+    @sessionState()
     @authorized
     async def clbk_dlrelease(self, update, context, args, state):
         idx = int(args[1])
         releases = state.releases or []
         if idx >= len(releases):
-            return Response(caption="Release no longer available.")
+            return Response(caption="Release no longer available.", state=state)
 
         release = releases[idx]
         result = self.download_release(
@@ -374,16 +417,17 @@ class Radarr(ExtArrService, ArrService):
             indexer_id=release.get("indexerId", 0),
         )
         if not result:
-            return Response(caption="Something went wrong — could not start the download.")
+            return Response(caption="Something went wrong — could not start the download.", state=state)
 
-        title = release.get("title", "Unknown")[:60]
-        return Response(caption=f"⬇️ Downloading:\n{title}")
+        state = replace(state, downloaded=[*state.downloaded, idx])
+        return self.create_message(state)
 
-    @clear
+    @repaint
     @callback(cmds=["add"])
-    @sessionState(clear=True)
+    @sessionState()
     @authorized
     async def clbk_add(self, update, context, args, state):
+        was_in_library = bool(state.items[state.index].get("id"))
         result = self.add(
             item=state.items[state.index],
             quality_profile_id=state.quality_profile.get("id"),
@@ -392,10 +436,14 @@ class Radarr(ExtArrService, ArrService):
             options={"addOptions": {"searchForMovie": args[1] == "search"}},
         )
         if not result:
-            return Response(caption="Seems like something went wrong...")
-        return Response(
-            caption="Movie updated!" if state.items[state.index].get("id") else "Movie added!"
-        )
+            return Response(caption="Seems like something went wrong...", state=state)
+
+        # Update the item in state with the full result (now has an ID assigned by Radarr)
+        new_items = list(state.items)
+        new_items[state.index] = result
+        state = replace(state, items=new_items, menu=None, releases=None, release_page=0)
+        self.session_db.add_session_entry(default_session_state_key_fn(self, update), state)
+        return self.create_message(state, full_redraw=True)
 
     @clear
     @callback(cmds=["cancel"])
